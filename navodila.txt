@@ -1,0 +1,37 @@
+Zahteve:
+    - komunikacija s funkcijskim generatorjem
+    - komunikacija z osci modulom
+
+Funkcije funkcijeskega generatorja:
+    - nastavljanje tipa signala
+    - nastavljanje amplitude
+    - nastavljanje frekvence
+    - nastavljanje offseta
+Dodatne funkcije:
+    - poizvedba trenutne konfiguracije
+    - smiselni preseti (sine 1V 500Hz, itd.)
+    - sweep
+    - burst
+
+Funkcije osciloskopa:
+    - GUI
+    - realtime prikaz singala (frekenca, amplituda, offset)
+    - skaliranje amplitude in periode
+    - autoscale
+    - več kanalov
+    - trigger (interni in zunanji)
+    - kurzorji
+    - meritve:
+        - rms
+        - duty cycle
+        - frekvenca
+        - perioda
+        - min/max
+        - pp
+        - offset
+    - matematika (seštevanje, odštevanje signalov, integracija, konvolucija, odvod, fft)
+    - shranjevanje (podatkov in gui-ja)
+
+
+
+
