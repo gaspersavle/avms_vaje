@@ -24,6 +24,7 @@ class Oscilloscope:
         self.running = True
         self.task_running = False  # New flag to track task state
         self.after_id = None
+        self.single_mode = False
 
         # Initialize scales
         self.time_per_div = 0.1  # seconds/div
@@ -31,6 +32,22 @@ class Oscilloscope:
 
         self.channel_offsets = [1.0, -1.0]  # Vertical offsets for each channel
         self.separation_factor = 1.5  # How much to separate the channels
+
+        # Trigger
+        self.single_mode = False
+        self.single_mode_var = tk.BooleanVar(value=False)
+
+        # Cursor variables
+        self.cursors_active = False
+        self.cursor_source = 0  # 0 for Channel 1, 1 for Channel 2
+        self.h_cursors = [None, None]  # Horizontal (time) cursors
+        self.v_cursors = [None, None]  # Vertical (voltage) cursors
+        self.cursor_lines = []  # To store reference to cursor lines
+        self.cursor_text = None  # For measurement display
+
+        # Cursor flag variables
+        self.cursor_flags = []  # To store flag handles
+        self.flag_size = 0.02  # Size of flags relative to axis size
 
         # Ensure time and data buffers are always the same length
         self.time = np.linspace(0, self.num_samples / self.sample_rate, self.num_samples)
@@ -85,8 +102,8 @@ class Oscilloscope:
         ttk.Label(self.controls_frame, text="Time/Div (s)").pack()
         self.time_scale_slider = tk.Scale(
             self.controls_frame, 
-            from_=0.0001, to=1.0, 
-            resolution=0.0001,
+            from_=0.0001, to=0.5, 
+            resolution=0.00001,
             orient=tk.HORIZONTAL,
             command=lambda val: self.set_time_scale(float(val))
         )
@@ -156,6 +173,332 @@ class Oscilloscope:
         self.freq_label = ttk.Label(self.controls_frame, text="Ch1 Freq: -- Hz\nCh2 Freq: -- Hz")
         self.freq_label.pack(pady=10)
 
+        # Add cursor controls
+        ttk.Separator(self.controls_frame, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
+        
+        # Cursor source selection
+        self.cursor_source_frame = ttk.Frame(self.controls_frame)
+        self.cursor_source_frame.pack(fill=tk.X, pady=5)
+        ttk.Label(self.cursor_source_frame, text="Cursor Source:").pack(side=tk.LEFT)
+        self.cursor_source_var = tk.IntVar(value=0)
+        ttk.Radiobutton(self.cursor_source_frame, text="Ch1", variable=self.cursor_source_var, 
+                    value=0, command=self.update_cursor_source).pack(side=tk.LEFT)
+        ttk.Radiobutton(self.cursor_source_frame, text="Ch2", variable=self.cursor_source_var, 
+                    value=1, command=self.update_cursor_source).pack(side=tk.LEFT)
+        
+        self.cursor_button = ttk.Button(self.controls_frame, text="Enable Cursors", 
+                                    command=self.toggle_cursors)
+        self.cursor_button.pack(pady=5)
+
+
+        ttk.Label(self.controls_frame, text="Trigger Level (Ch1)").pack(pady=(10, 0))
+        self.trigger_level = tk.DoubleVar(value=0.0)
+        self.trigger_slider = tk.Scale(
+            self.controls_frame, from_=-10, to=10, resolution=0.01,
+            orient=tk.HORIZONTAL, variable=self.trigger_level,
+            command=self.on_trigger_change
+        )
+
+        self.trigger_slider.pack(fill=tk.X, padx=5, pady=5)
+
+        self.single_mode_var = tk.BooleanVar(value=False)
+        self.single_button = ttk.Checkbutton(
+            self.controls_frame,
+            text="Single Mode",
+            variable=self.single_mode_var,
+            command=self.toggle_single_mode
+        )
+        self.single_button.pack(pady=5)
+
+        
+        # Measurement display
+        self.measurement_frame = ttk.Frame(self.controls_frame)
+        self.measurement_frame.pack(fill=tk.X, pady=5)
+        self.measurement_label = ttk.Label(self.measurement_frame, text="Measurements:")
+        self.measurement_label.pack()
+        self.measurement_text = tk.Text(self.measurement_frame, height=4, width=25)
+        self.measurement_text.pack()
+        self.measurement_text.config(state=tk.DISABLED)
+
+
+        # Single Mode Toggle
+        self.single_button = ttk.Checkbutton(
+            self.controls_frame,
+            text="Single Mode",
+            variable=self.single_mode_var,
+            command=self.toggle_single_mode
+        )
+        self.single_button.pack(pady=5)
+
+    def on_trigger_change(self, val):
+        """Update trigger level and line position"""
+        trigger_val = float(val)
+        self.trigger_level.set(trigger_val)
+        
+        # Update the trigger line position
+        if hasattr(self, 'trigger_line'):
+            self.trigger_line.set_ydata([trigger_val, trigger_val])
+            self.canvas.draw_idle()
+        
+        # If in single mode, capture new data with this trigger level
+        if self.single_mode:
+            self.capture_and_display_once()
+
+
+    def toggle_cursors(self):
+        self.cursors_active = not self.cursors_active
+        self.cursor_button.config(text="Disable Cursors" if self.cursors_active else "Enable Cursors")
+        
+        if self.cursors_active:
+            self.activate_cursors()
+        else:
+            self.deactivate_cursors()
+        
+            
+        self.canvas.draw()
+
+    def activate_cursors(self):
+        # Create cursor lines if they don't exist
+        if not self.cursor_lines:
+            color = 'blue' if self.cursor_source == 0 else 'red'
+            
+            # Initialize horizontal cursors at 25% and 75% of time window
+            x_span = self.time_per_div * 10
+            h1_pos = x_span * 0.25
+            h2_pos = x_span * 0.75
+            
+            # Initialize vertical cursors at 25% and 75% of voltage range
+            v1_pos = -3  # 25% of -8 to 8 range
+            v2_pos = 3   # 75% of -8 to 8 range
+            
+            # Horizontal (time) cursors - make them taller for better visibility
+            self.h_cursors[0] = self.ax.axvline(h1_pos, color='green', linestyle='--', 
+                                            alpha=0.7, linewidth=1.5, ymin=0, ymax=1)
+            self.h_cursors[1] = self.ax.axvline(h2_pos, color='green', linestyle='--', 
+                                            alpha=0.7, linewidth=1.5, ymin=0, ymax=1)
+            
+            # Vertical (voltage) cursors - make them wider for better visibility
+            self.v_cursors[0] = self.ax.axhline(v1_pos, color=color, linestyle=':', 
+                                            alpha=0.7, linewidth=1.5, xmin=0, xmax=1)
+            self.v_cursors[1] = self.ax.axhline(v2_pos, color=color, linestyle=':', 
+                                            alpha=0.7, linewidth=1.5, xmin=0, xmax=1)
+            
+            self.cursor_lines = self.h_cursors + self.v_cursors
+            
+            # Add text for measurements
+            self.cursor_text = self.ax.text(0.02, 0.95, '', transform=self.ax.transAxes,
+                                        bbox=dict(facecolor='white', alpha=0.7))
+            self.create_cursor_flags()
+
+        # Make cursors visible
+        for line in self.cursor_lines:
+            line.set_visible(True)
+        if self.cursor_text:
+            self.cursor_text.set_visible(True)
+        
+        # Update cursor appearance based on source
+        self.update_cursor_appearance()
+        
+        # Connect mouse events
+        self.cid_press = self.canvas.mpl_connect('button_press_event', self.on_press)
+        self.cid_motion = self.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        self.cid_release = self.canvas.mpl_connect('button_release_event', self.on_release)
+        
+        self.update_measurements()
+
+    def create_cursor_flags(self):
+        """Create visual flags at the ends of cursors for easier grabbing"""
+        color = 'blue' if self.cursor_source == 0 else 'red'
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        
+        # Remove existing flags if any
+        for flag in self.cursor_flags:
+            flag.remove()
+        self.cursor_flags = []
+        
+        # Create flags for horizontal (time) cursors
+        for i, line in enumerate(self.h_cursors):
+            x = line.get_xdata()[0]
+            # Top flag for first cursor, bottom for second
+            y_flag = ylim[1] - (ylim[1]-ylim[0])*0.1 if i == 0 else ylim[0] + (ylim[1]-ylim[0])*0.1
+            flag = self.ax.plot([x, x], [y_flag, line.get_ydata()[0]], 
+                            color='green', linewidth=2, alpha=0.7)[0]
+            
+            #flag = self.ax.
+            self.cursor_flags.append(flag)
+        
+        # Create flags for vertical (voltage) cursors
+        for i, line in enumerate(self.v_cursors):
+            y = line.get_ydata()[0]
+            # Left flag for first cursor, right for second
+            x_flag = xlim[0] + (xlim[1]-xlim[0])*0.1 if i == 0 else xlim[1] - (xlim[1]-xlim[0])*0.1
+            flag = self.ax.plot([x_flag, line.get_xdata()[0]], [y, y], 
+                            color=color, linewidth=2, alpha=0.7)[0]
+            self.cursor_flags.append(flag)
+        
+        self.canvas.draw()
+
+    def update_cursor_source(self):
+        self.cursor_source = self.cursor_source_var.get()
+        if self.cursors_active:
+            self.update_cursor_appearance()
+            self.update_measurements()
+
+    def update_cursor_appearance(self):
+        """Update cursor and flag colors based on selected source channel"""
+        if not self.cursors_active:
+            return
+        
+        color = 'blue' if self.cursor_source == 0 else 'red'
+        
+        # Update vertical cursor colors
+        for line in self.v_cursors:
+            if line:
+                line.set_color(color)
+        
+        # Update vertical flag colors (flags 2 and 3)
+        for flag in self.cursor_flags[2:]:
+            if flag:
+                flag.set_color(color)
+        
+        self.canvas.draw()
+
+    def deactivate_cursors(self):
+        # Hide cursor lines and flags
+        for line in self.cursor_lines:
+            line.set_visible(False)
+        for flag in self.cursor_flags:
+            flag.set_visible(False)
+        if self.cursor_text:
+            self.cursor_text.set_visible(False)
+        
+        # Disconnect mouse events
+        if hasattr(self, 'cid_press'):
+            self.canvas.mpl_disconnect(self.cid_press)
+        if hasattr(self, 'cid_motion'):
+            self.canvas.mpl_disconnect(self.cid_motion)
+        if hasattr(self, 'cid_release'):
+            self.canvas.mpl_disconnect(self.cid_release)
+        
+        self.canvas.draw()
+
+
+    def on_press(self, event):
+        if not self.cursors_active or event.inaxes != self.ax:
+            return
+        
+        x, y = event.xdata, event.ydata
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        x_range = xlim[1] - xlim[0]
+        y_range = ylim[1] - ylim[0]
+        
+        # Check cursor flags first (easier to hit)
+        for i, flag in enumerate(self.cursor_flags):
+            flag_x = flag.get_xdata()
+            flag_y = flag.get_ydata()
+            
+            # Calculate distance to flag line
+            if i < 2:  # Horizontal cursor flags (vertical lines)
+                dist = abs(flag_x[0] - x) / x_range
+                if dist < 0.02:  # Very sensitive for flags
+                    self.dragging = ('h', i)
+                    break
+            else:  # Vertical cursor flags (horizontal lines)
+                dist = abs(flag_y[0] - y) / y_range
+                if dist < 0.02:  # Very sensitive for flags
+                    self.dragging = ('v', i-2)  # Adjust index for v_cursors
+                    break
+        
+        # If no flag clicked, check cursor lines directly
+        if self.dragging is None:
+            for i, line in enumerate(self.v_cursors):
+                cursor_y = line.get_ydata()[0]
+                dist = abs(cursor_y - y) / y_range
+                if dist < min_dist and dist < 0.05:  # 5% of y-range
+                    min_dist = dist
+                    self.dragging = ('v', i)
+                    break  # Found closest cursor
+        
+        # If we found a cursor to drag, store its initial position
+        if self.dragging is not None:
+            self.drag_start = (x, y)
+
+    def on_motion(self, event):
+        if not hasattr(self, 'dragging') or self.dragging is None or not event.inaxes:
+            return
+        
+        x, y = event.xdata, event.ydata
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        
+        if self.dragging[0] == 'h':  # Moving horizontal cursor
+            idx = self.dragging[1]
+            x = max(xlim[0], min(xlim[1], x))
+            self.h_cursors[idx].set_xdata([x, x])
+            # Update corresponding flag
+            flag_idx = idx  # First two flags are for horizontal cursors
+            flag = self.cursor_flags[flag_idx]
+            flag.set_xdata([x, x])
+            
+        elif self.dragging[0] == 'v':  # Moving vertical cursor
+            idx = self.dragging[1]
+            y = max(ylim[0], min(ylim[1], y))
+            self.v_cursors[idx].set_ydata([y, y])
+            # Update corresponding flag
+            flag_idx = idx + 2  # Last two flags are for vertical cursors
+            flag = self.cursor_flags[flag_idx]
+            flag.set_ydata([y, y])
+        
+        self.update_measurements()
+        self.canvas.draw()
+
+    def on_release(self, event):
+        if hasattr(self, 'dragging'):
+            del self.dragging
+        if hasattr(self, 'drag_start'):
+            del self.drag_start
+        self.update_measurements()
+
+    def update_measurements(self):
+        if not self.cursors_active or not all(line.get_visible() for line in self.cursor_lines):
+            return
+        
+        # Get cursor positions
+        h1, h2 = [line.get_xdata()[0] for line in self.h_cursors]
+        v1, v2 = [line.get_ydata()[0] for line in self.v_cursors]
+        
+        # Calculate time difference
+        delta_t = abs(h2 - h1)
+        freq = 1/delta_t if delta_t > 0 else 0
+        
+        # Calculate voltage difference for selected channel
+        delta_v = abs(v2 - v1)
+        
+        # Convert to real voltage (remove scaling/offset)
+        real_v1 = (v1 - self.channel_offsets[self.cursor_source]) * self.volts_per_div[self.cursor_source]
+        real_v2 = (v2 - self.channel_offsets[self.cursor_source]) * self.volts_per_div[self.cursor_source]
+        real_delta_v = abs(real_v2 - real_v1)
+        
+        # Update text display
+        text = (f"Source: Ch{self.cursor_source+1}\n"
+                f"Time Δ: {delta_t*1e3:.2f} ms\n"
+                f"Freq: {freq:.2f} Hz\n"
+                f"Voltage Δ: {delta_v:.2f} div\n"
+                f"({real_delta_v:.3f} V)")
+        
+        if self.cursor_text:
+            self.cursor_text.set_text(text)
+        
+        # Update measurement text box
+        self.measurement_text.config(state=tk.NORMAL)
+        self.measurement_text.delete(1.0, tk.END)
+        self.measurement_text.insert(tk.END, text)
+        self.measurement_text.config(state=tk.DISABLED)
+        
+        self.canvas.draw()
+
     def create_plot(self):
         self.fig, self.ax = plt.subplots(figsize=(10, 5))
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
@@ -169,6 +512,12 @@ class Oscilloscope:
             self.ax.axhline(self.channel_offsets[0], color='blue', linestyle=':', alpha=0.5),
             self.ax.axhline(self.channel_offsets[1], color='red', linestyle=':', alpha=0.5)
         ]
+
+        # Trigger line
+        self.trigger_line = self.ax.axhline(
+            y=self.trigger_level.get(), color='magenta',
+            linestyle='--', linewidth=1.5, alpha=0.7, label='Trigger'
+        )
 
         self.ax.set_xlabel("")
         self.ax.set_ylabel("")
@@ -199,6 +548,23 @@ class Oscilloscope:
         self.time_scale_slider.set(self.time_per_div)
         #self.volt_scale_slider1.set(self.volts_per_div[0])
         #self.volt_scale_slider2.set(self.volts_per_div[1])
+        if self.cursors_active:
+            self.create_cursor_flags()  # Recreate flags with new limits
+            xlim = self.ax.get_xlim()
+            ylim = self.ax.get_ylim()
+            
+            for line in self.h_cursors:
+                x = line.get_xdata()[0]
+                if x < xlim[0] or x > xlim[1]:
+                    line.set_xdata([xlim[0] + 0.1*(xlim[1]-xlim[0])])
+            
+            for line in self.v_cursors:
+                y = line.get_ydata()[0]
+                if y < ylim[0] or y > ylim[1]:
+                    line.set_ydata([ylim[0] + 0.1*(ylim[1]-ylim[0])])
+
+            
+            self.update_measurements()
 
         # Update vertical slider ranges
         for ch, slider in enumerate([self.offset_slider1, self.offset_slider2]):
@@ -229,8 +595,8 @@ class Oscilloscope:
             print("DAQ reconfiguration failed:", e)
 
     def update_plot(self):
-        if not self.running or not self.root.winfo_exists():
-            return
+        if not self.root.winfo_exists() or (not self.running and not self.single_mode):
+                return
 
         try:
             if not self.data_queue.empty():
@@ -251,22 +617,82 @@ class Oscilloscope:
                         
                         # Apply vertical scale and offset
                         channel_data = channel_data / self.volts_per_div[ch] + self.channel_offsets[ch]
-
                         
                         # Update plot data
                         self.lines[ch].set_data(display_time, channel_data)
 
+                    # Update offset lines
                     for ch in range(2):
                         self.offset_lines[ch].set_ydata([self.channel_offsets[ch]] * 2)
                     
+                    # Update trigger line (ensure it's visible)
+                    trigger_val = self.trigger_level.get()
+                    scaled_trigger = trigger_val / self.volts_per_div[0] + self.channel_offsets[0]
+                    self.trigger_line.set_ydata([scaled_trigger, scaled_trigger])
+                    
                     self.canvas.draw_idle()
-                else:
-                    print(f"Unexpected data shape: {new_data.shape}")
 
         except Exception as e:
             print(f"update_plot exception: {e}")
         
         self.after_id = self.root.after(50, self.update_plot)
+
+
+    def toggle_single_mode(self):
+        self.single_mode = self.single_mode_var.get()
+
+        if self.single_mode:
+            self.running = False
+            if self.task_running:
+                try:
+                    self.task.stop()
+                    self.task_running = False
+                except Exception as e:
+                    print(f"Error stopping task for single mode: {e}")
+            self.capture_and_display_once()
+        else:
+            self.running = True
+            if not self.task_running:
+                self.start_daq_task()
+
+
+    def capture_and_display_once(self):
+        try:
+            with nidaqmx.Task() as temp_task:
+                for device_name in self.device_names:
+                    temp_task.ai_channels.add_ai_voltage_chan(
+                        device_name, min_val=-10, max_val=10,
+                        terminal_config=TerminalConfiguration.RSE
+                    )
+                temp_task.timing.cfg_samp_clk_timing(
+                    self.sample_rate,
+                    sample_mode=AcquisitionType.FINITE,
+                    samps_per_chan=self.num_samples * 2
+                )
+                temp_task.start()
+                data = temp_task.read(
+                    number_of_samples_per_channel=self.num_samples * 2,
+                    timeout=2.0
+                )
+                data = np.asarray(data)
+
+            trigger_val = self.trigger_level.get()
+            
+            # Find trigger point on channel 1 (but apply to both channels)
+            trigger_idx = self.find_trigger_index_with_threshold(data[0], trigger_val)
+
+            if trigger_idx and self.num_samples // 2 < trigger_idx < data.shape[1] - self.num_samples // 2:
+                start_idx = trigger_idx - self.num_samples // 2
+                data = data[:, start_idx:start_idx + self.num_samples]
+            else:
+                data = data[:, -self.num_samples:]
+
+            if self.data_queue.full():
+                self.data_queue.get_nowait()
+            self.data_queue.put(data)
+
+        except Exception as e:
+            print(f"Single capture failed: {e}")
 
     def daq_reader(self):
         while True:
@@ -409,17 +835,22 @@ class Oscilloscope:
             self.volt_scale_slider1.configure(state=tk.NORMAL)
             self.volt_scale_slider2.configure(state=tk.NORMAL)
 
-    def find_trigger_index(self, data):
-        """
-        Finds the index of the first rising zero-crossing near the center of the buffer.
-        """
+    def find_trigger_index_with_threshold(self, data, threshold):
+    
+    #Returns index of first rising edge crossing the given threshold,
+    #near the middle of the buffer.
+    
         midpoint = len(data) // 2
-        threshold = np.mean(data)
+        search_range = 5000
 
-        for i in range(midpoint - 100, midpoint + 100):
-            if 0 < i < len(data) and data[i - 1] < threshold and data[i] >= threshold:
+        start = max(1, midpoint - search_range)
+        end = min(len(data) - 1, midpoint + search_range)
+
+        for i in range(start, end):
+            if data[i - 1] < threshold <= data[i]:
                 return i
         return None
+
 
     def start_daq_task(self):
         """Helper method to start DAQ task with proper configuration"""
@@ -467,9 +898,16 @@ class Oscilloscope:
         except Exception as e:
             print("Error while closing DAQ task:", e)
 
+        # Safely cancel any scheduled updates
         if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
+            try:
+                self.root.after_cancel(self.after_id)
+            except Exception as e:
+                print(f"Error canceling after_id: {e}")
+
+        # Properly destroy the root to avoid idle_draw issues
         self.root.quit()
+        self.root.destroy()
 
 
 if __name__ == "__main__":
@@ -478,7 +916,6 @@ if __name__ == "__main__":
 
     def on_closing():
         app.close()
-        root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
